@@ -15,6 +15,11 @@ eyes.
   rotation is saved in the photos (EXIF) and videos (MP4).
 - Keyboard keys, and signals for scripts.
 
+![Ocellus on a Galaxy Tab S3, with the side panel](screenshot.png)
+
+The viewfinder in the screenshot shows a drawing, put in place of the
+camera picture.
+
 ## Devices
 
 The app takes its cameras from libcamera. On a device it knows (the `TUNED`
@@ -36,8 +41,20 @@ pipeline with the GPU software ISP, and Venus encodes the video.
 | Rear, Sony IMX258, autofocus | 3840x2160 | 4K H.265 (24), 1080p (30, 60), 720p (30, 60), 576p (30, 60, 120) |
 | Front, Samsung S5K5E3 | 2568x1932 | 1080p (30), 864p (30, 60), 384p (30, 60, 120) |
 
-Measured from the frame timestamps of recordings: 59.8 fps for the 60 fps
-modes, 119.6 fps for 120.
+Measured in the Plasma session with the viewfinder on and sound, from the
+frame timestamps of 8 s recordings (after the first second):
+
+| Camera | Mode | fps measured |
+|---|---|---|
+| Rear | 4K | 24.0 |
+| Rear | 1080p | 30.0; 59.6 to 60.0 |
+| Rear | 720p | 59.6 |
+| Rear | 576p | 59.6; 119.3 to 120.0 |
+| Front | 1080p | 29.9 |
+| Front | 864p | 59.8 to 59.9 |
+| Front | 384p | 59.8 to 60.7; 119.6 to 120.1 |
+
+The 30 fps modes missing from the table weren't measured.
 
 ## Install
 
@@ -115,10 +132,11 @@ entry.
 
 ## Known issues
 
-- On the Tab S3, two of eleven 120 fps test recordings stalled after a
-  second or two, both on the front camera. The app now switches the frame
-  rate half a second after the stream starts instead of right away; one of
-  the nine recordings since then still stalled.
+- On the Tab S3, the microphone sometimes starts 5 s late (2 of 20 test
+  recordings at 120 fps). The kernel's q6asm driver waits out a 5 s
+  timeout when PipeWire prepares the capture a second time. The video
+  keeps running, but drops frames until the sound starts. A kernel fix is
+  being tested.
 - On the Tab S3, 4K is H.265 at 24 fps only. Venus encodes 4K at about
   29.8 fps, and it refuses 25.
 - A photo is a viewfinder frame, so the rear camera's photos are 3840x2160,
