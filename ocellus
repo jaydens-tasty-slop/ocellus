@@ -373,6 +373,11 @@ class CameraApp:
     def start(self, desc):
         log('pipeline: ' + desc)
         pipeline = Gst.parse_launch(desc)
+        # libcamera's frame timestamps are CLOCK_MONOTONIC. On the
+        # microphone's clock (the default when there is sound), the video
+        # timestamps stand still until the sound starts, which can be
+        # seconds late.
+        pipeline.use_clock(Gst.SystemClock.obtain())
         sink = pipeline.get_by_name('sink')
         sink.set_property('rotate-method', TURNS[self.turns()][0])
         video = sink.get_property('widget')
