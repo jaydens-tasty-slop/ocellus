@@ -145,4 +145,4 @@ entry.
 
 ## License
 
-GPL-3.0-or-later, see `LICENSE`.
+CC0-1.0: Ocellus is dedicated to the public domain, see `LICENSE`.
