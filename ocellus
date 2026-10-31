@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ocellus: a camera for Linux phones and tablets, on libcamera and
+# GStreamer. Full-screen viewfinder, photos to ~/Pictures, videos with
+# sound to ~/Videos.
+#
+# Keys: Space or Enter photo, V record/stop, F flip, Q video quality,
+# S frame rate, R rotate, Esc close. kill -USR1 <pid> takes a photo,
+# kill -USR2 starts and stops a video, kill -TERM closes (after saving a
+# video in progress).
+#
+# The cameras come from libcamera. On a device listed in TUNED, each camera
+# gets the photo size and the video modes measured on that device, with
+# the hardware encoder; anywhere else the app offers 1080p, 720p and 480p
+# at 30 fps with the H.264 encoder GStreamer has (OCELLUS_GENERIC=1 does
+# that on a tuned device too).
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+os.environ.setdefault('LIBCAMERA_SOFTISP_MODE', 'gpu')
+
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstVideo', '1.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk
+
+APP_ID = 'io.github.jaydens_tasty_slop.Ocellus'
+VERSION = '0.1'
+
+# Devices this was measured on, by device tree compatible.
+#  vblank: libcamera can't set the frame rate (the simple pipeline has no
+#          FrameDurationLimits), so for rates above 30 the app shortens the
+#          sensor's vertical blanking itself once the stream runs.
+#  dmabuf: the encoder takes the camera's RGBA dma-bufs as they are.
+# Per sensor model: autofocus, the viewfinder and photo size, and the
+# video modes: label, size, codec, frame rates.
+TUNED = {
+    # Samsung Galaxy Tab S3 (SM-T820): the simple pipeline with the GPU
+    # software ISP, Venus encoder. libcamera picks the smallest sensor mode
+    # that holds the size, and the frame rates are what that mode reaches:
+    # rear 4208x2368 (39 fps; the encoder manages about 29.8 at 4K and
+    # refuses 25, so 4K stays at 24), 2104x1184 (75), 1048x592 (144);
+    # front 2576x1932 (30), 1280x960 (60), 640x480 (120). The ISP output
+    # is 8 pixels narrower than the sensor mode, and Venus sizes the RGBA
+    # buffers it imports for a width that is a multiple of 128 pixels, so
+    # all widths are (a narrower buffer is refused).
+    'samsung,gts3lwifi': {
+        'vblank': True,
+        'dmabuf': True,
+        'cameras': {
+            'imx258': {
+                'af': True,
+                'photo': (3840, 2160),
+                'modes': [
+                    ('4K', 3840, 2160, 'h265', (24,)),
+                    ('1080p', 1920, 1080, 'h264', (30, 60)),
+                    ('720p', 1280, 720, 'h264', (30, 60)),
+                    ('576p', 1024, 576, 'h264', (30, 60, 120)),
+                ],
+            },
+            's5k5e3': {
+                'af': False,
+                'photo': (2568, 1932),
+                'modes': [
+                    ('1080p', 1920, 1080, 'h264', (30,)),
+                    ('864p', 1152, 864, 'h264', (30, 60)),
+                    ('384p', 512, 384, 'h264', (30, 60, 120)),
+                ],
+            },
+        },
+    },
+}
+
+GENERIC_MODES = [('1080p', 1920, 1080), ('720p', 1280, 720), ('480p', 640, 480)]
+# largest viewfinder and photo size on devices not in TUNED
+GENERIC_PHOTO_PIXELS = 3840 * 2160
+
+# H.264 levels: name, V4L2 enum, macroblocks per second, frame size in MBs
+H264_LEVELS = [
+    ('3', 8, 40500, 1620), ('3.1', 9, 108000, 3600),
+    ('3.2', 10, 216000, 5120), ('4', 11, 245760, 8192),
+    ('4.2', 13, 522240, 8704), ('5.1', 15, 983040, 36864),
+]
+
+LOCATIONS = {
+    'CameraLocationBack': ('back', 'Rear camera'),
+    'CameraLocationFront': ('front', 'Front camera'),
+    'CameraLocationExternal': ('external', 'External camera'),
+}
+
+PICTURES = os.path.expanduser('~/Pictures')
+VIDEOS = os.path.expanduser('~/Videos')
+CONFIG = os.path.join(GLib.get_user_config_dir(), 'ocellus')
+
+_M = GstVideo.VideoOrientationMethod
+# Clockwise quarter turns: sink rotate method, orientation tag
+TURNS = [
+    (_M.IDENTITY, None),
+    (getattr(_M, '90R'), 'rotate-90'),
+    (getattr(_M, '180'), 'rotate-180'),
+    (getattr(_M, '90L'), 'rotate-270'),
+]
+
+AUDIO_ELEMENTS = ('asrc', 'aconv', 'aresample', 'aenc', 'aparse', 'aqueue')
+
+CSS = b"""
+window, .panel { background: black; }
+button.cam {
+    font-size: 24px;
+    font-weight: bold;
+    padding: 16px 26px;
+    min-width: 210px;
+    color: white;
+    background: #222;
+    border: 2px solid rgba(255, 255, 255, 0.7);
+    border-radius: 18px;
+    box-shadow: none;
+    text-shadow: none;
+}
+button.cam:active { background: #666; }
+button.cam:disabled { color: #777; border-color: #555; }
+button.shoot { min-height: 96px; }
+button.recording { background: #b00; border-color: #f66; }
+label.cam { font-size: 20px; color: white; }
+"""
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def config_get(name, default):
+    try:
+        with open(os.path.join(CONFIG, name)) as f:
+            return f.read().strip() or default
+    except OSError:
+        return default
+
+
+def config_set(name, value):
+    try:
+        os.makedirs(CONFIG, exist_ok=True)
+        with open(os.path.join(CONFIG, name), 'w') as f:
+            f.write('%s\n' % value)
+    except OSError:
+        pass
+
+
+def device_compatibles():
+    try:
+        with open('/proc/device-tree/compatible', 'rb') as f:
+            return [c.decode() for c in f.read().split(b'\0') if c]
+    except OSError:
+        return []
+
+
+def find_element(*names):
+    for name in names:
+        if Gst.ElementFactory.find(name) is not None:
+            return name
+    return None
+
+
+class Camera:
+    """A libcamera camera, and what the app does with it."""
+
+    # libcamerasrc has had af-mode since libcamera 0.5
+    has_af_mode = False
+
+    def __init__(self, device, tuning):
+        self.id = device.create_element(None).get_property('camera-name')
+        props = device.get_properties()
+        self.model = props.get_string('api.libcamera.Model') or 'camera'
+        location = props.get_string('api.libcamera.Location')
+        self.location, self.name = LOCATIONS.get(location, ('', self.model))
+        ok, rotation = props.get_int('api.libcamera.Rotation')
+        # degrees counter-clockwise to show the picture upright
+        self.rotation = rotation if ok else 0
+        self.key = re.sub(r'[^A-Za-z0-9]+', '-', '%s-%s' % (
+            self.model, self.location)).strip('-')
+
+        sizes = set()
+        caps = device.get_caps()
+        for i in range(caps.get_size() if caps else 0):
+            s = caps.get_structure(i)
+            ok_w, w = s.get_int('width')
+            ok_h, h = s.get_int('height')
+            if ok_w and ok_h:
+                sizes.add((w, h))
+
+        tuned = tuning.get('cameras', {}).get(self.model)
+        self.tuned = tuned is not None
+        self.vblank = self.tuned and tuning.get('vblank', False)
+        self.dmabuf = self.tuned and tuning.get('dmabuf', False)
+        if tuned:
+            self.af = self.continuous_af = tuned['af']
+            self.photo = tuned['photo']
+            self.modes = tuned['modes']
+        else:
+            # ask for continuous autofocus, which libcamera ignores without
+            # a lens, but don't promise it in the title
+            self.af = False
+            self.continuous_af = True
+            fits = [s for s in sizes if s[0] * s[1] <= GENERIC_PHOTO_PIXELS]
+            self.photo = max(fits, key=lambda s: s[0] * s[1]) if fits else None
+            self.modes = [(name, w, h, 'h264', (30,))
+                          for name, w, h in GENERIC_MODES
+                          if not sizes or (w, h) in sizes]
+            if not self.modes:
+                self.modes = [('%dp' % self.photo[1], self.photo[0],
+                               self.photo[1], 'h264', (30,))] \
+                    if self.photo else [('auto', 0, 0, 'h264', (30,))]
+
+    def source(self, width, height, fmt=None, fps=None):
+        src = 'libcamerasrc name=src camera-name="%s"' % self.id
+        if self.continuous_af and Camera.has_af_mode:
+            src += ' af-mode=continuous'
+        caps = ['video/x-raw']
+        if width:
+            caps.append('width=%d,height=%d' % (width, height))
+        if fmt:
+            caps.append('format=' + fmt)
+        if fps:
+            caps.append('framerate=%d/1' % fps)
+        return '%s ! %s' % (src, ','.join(caps))
+
+
+def find_cameras():
+    """libcamera's cameras, rear ones first."""
+    factory = Gst.DeviceProviderFactory.find('libcameraprovider')
+    if factory is None:
+        log('no libcamera GStreamer plugin (libcamerasrc)')
+        return []
+    src = Gst.ElementFactory.make('libcamerasrc')
+    Camera.has_af_mode = src is not None and src.find_property('af-mode') is not None
+    tuning = {}
+    # OCELLUS_GENERIC=1: what a device that isn't in TUNED gets
+    generic = os.environ.get('OCELLUS_GENERIC', '') not in ('', '0')
+    for compatible in [] if generic else device_compatibles():
+        if compatible in TUNED:
+            tuning = TUNED[compatible]
+            log('tuned for %s' % compatible)
+            break
+    cameras = [Camera(d, tuning) for d in factory.get().get_devices()]
+    order = {'back': 0, 'front': 1}
+    cameras.sort(key=lambda c: (order.get(c.location, 2), c.id))
+    seen = {}
+    for cam in cameras:
+        n = seen[cam.key] = seen.get(cam.key, 0) + 1
+        if n > 1:
+            cam.key += '-%d' % n
+            cam.name += ' %d' % n
+    for cam in cameras:
+        log('camera %s: %s, %s, rotation %d, photo %s, %s' % (
+            cam.key, cam.id, cam.name, cam.rotation, cam.photo,
+            'tuned' if cam.tuned else 'generic'))
+    return cameras
+
+
+def find_mic():
+    """The default PulseAudio/PipeWire source if it is a microphone, else
+    the first one that isn't a monitor."""
+    try:
+        out = subprocess.run(['pactl', 'get-default-source'], text=True,
+                             capture_output=True, timeout=5).stdout.strip()
+        if out and not out.endswith('.monitor'):
+            return out
+        out = subprocess.run(['pactl', 'list', 'short', 'sources'], text=True,
+                             capture_output=True, timeout=5).stdout
+        for line in out.splitlines():
+            fields = line.split('\t')
+            if len(fields) > 1 and not fields[1].endswith('.monitor'):
+                return fields[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+class CameraApp:
+    def __init__(self):
+        self.cameras = find_cameras()
+        key = config_get('camera', '')
+        self.cam = next((c for c in self.cameras if c.key == key),
+                        self.cameras[0] if self.cameras else None)
+        self.pipeline = None
+        self.sink = None
+        self.video = None
+        self.recording = None      # (path, start time, with audio) while recording
+        self.stopping = False
+        self.status_timer = 0
+        self.clock_timer = 0
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.win = Gtk.Window(title='Camera')
+        self.win.connect('delete-event', self.on_delete)
+        self.win.connect('key-press-event', self.on_key)
+
+        # The sink shows the video in a Wayland subsurface above the window,
+        # so the controls sit beside the video, not over it.
+        self.layout = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        panel.get_style_context().add_class('panel')
+        panel.set_valign(Gtk.Align.CENTER)
+        panel.set_margin_start(22)
+        panel.set_margin_end(22)
+
+        self.status = Gtk.Label()
+        self.status.get_style_context().add_class('cam')
+        self.status.set_line_wrap(True)
+        self.status.set_max_width_chars(16)
+        self.status.set_justify(Gtk.Justification.CENTER)
+        panel.pack_start(self.status, False, False, 0)
+
+        self.buttons = {}
+        for key, label, extra, handler in (
+                ('photo', 'Take photo', 'shoot', self.take_photo),
+                ('record', 'Record', 'shoot', self.toggle_record),
+                ('quality', '', None, self.next_quality),
+                ('fps', '', None, self.next_fps),
+                ('flip', 'Flip camera', None, self.flip),
+                ('rotate', 'Rotate', None, self.rotate),
+                ('close', 'Close', None, lambda *a: self.close())):
+            button = Gtk.Button(label=label)
+            button.get_style_context().add_class('cam')
+            if extra:
+                button.get_style_context().add_class(extra)
+            button.connect('clicked', handler)
+            panel.pack_start(button, False, False, 0)
+            self.buttons[key] = button
+        self.layout.pack_end(panel, False, False, 0)
+        self.win.add(self.layout)
+
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                             lambda: self.take_photo() or True)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2,
+                             lambda: self.toggle_record() or True)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM,
+                             lambda: self.close() or False)
+
+        self.update_labels()
+        self.win.fullscreen()
+        self.win.show_all()
+        if self.cam is None:
+            self.say('No camera found', 3600)
+            for key in ('photo', 'record', 'quality', 'fps', 'flip', 'rotate'):
+                self.buttons[key].set_sensitive(False)
+        else:
+            self.start_viewfinder()
+
+    # -- pipelines -----------------------------------------------------
+
+    def turns(self):
+        """Clockwise quarter turns for the current camera: the user's
+        choice, else what libcamera says the mounting needs."""
+        default = (-self.cam.rotation // 90) % 4
+        try:
+            return int(config_get('rotation-' + self.cam.key, default)) % 4
+        except ValueError:
+            return default
+
+    def start(self, desc):
+        log('pipeline: ' + desc)
+        pipeline = Gst.parse_launch(desc)
+        sink = pipeline.get_by_name('sink')
+        sink.set_property('rotate-method', TURNS[self.turns()][0])
+        video = sink.get_property('widget')
+        video.set_hexpand(True)
+        video.set_vexpand(True)
+        if self.video is not None:
+            self.layout.remove(self.video)
+        self.layout.pack_start(video, True, True, 0)
+        video.show()
+        self.pipeline, self.sink, self.video = pipeline, sink, video
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self.on_error)
+        bus.connect('message::eos', self.on_eos)
+        pipeline.set_state(Gst.State.PLAYING)
+
+    def stop_pipeline(self):
+        if self.pipeline is not None:
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+
+    def start_viewfinder(self):
+        self.stop_pipeline()
+        w, h = self.cam.photo or (0, 0)
+        # a tuned camera's format goes to the sink as it is
+        convert = '' if self.cam.tuned else ' ! videoconvert'
+        self.start('%s%s ! queue max-size-buffers=2 ! gtkwaylandsink name=sink'
+                   % (self.cam.source(w, h), convert))
+        self.update_labels()
+
+    def encoder(self, w, h, codec, fps):
+        """From raw video to a parsed H.264 or H.265 stream."""
+        rate = max(4000000, int(0.25 * w * h * fps) // 1000000 * 1000000)
+        if codec == 'h265':
+            # the level in the caps: the encoder sets its level control
+            # from them, over extra-controls
+            ctl = 'encode,video_bitrate=40000000,video_peak_bitrate=60000000'
+            return ('v4l2h265enc output-io-mode=dmabuf-import extra-controls="%s" '
+                    '! video/x-h265,level=(string)5.1 ! h265parse' % ctl)
+        level = h264_level(w, h, fps)
+        if self.cam.dmabuf:
+            ctl = 'encode,video_bitrate=%d,video_peak_bitrate=%d,h264_level=%d' % (
+                rate, rate * 3 // 2, level[1])
+            return ('v4l2h264enc output-io-mode=dmabuf-import extra-controls="%s" '
+                    '! video/x-h264,level=(string)%s ! h264parse' % (ctl, level[0]))
+        enc = find_element('v4l2h264enc', 'openh264enc', 'x264enc')
+        if enc == 'v4l2h264enc':
+            return ('videoconvert ! video/x-raw,format=NV12 ! v4l2h264enc '
+                    'extra-controls="encode,video_bitrate=%d" '
+                    '! video/x-h264,level=(string)%s ! h264parse' % (rate, level[0]))
+        if enc == 'openh264enc':
+            return ('videoconvert ! video/x-raw,format=I420 '
+                    '! openh264enc bitrate=%d complexity=low ! h264parse' % rate)
+        if enc == 'x264enc':
+            return ('videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency '
+                    'bitrate=%d ! h264parse' % (rate // 1000))
+        return None
+
+    def start_recording(self, audio=True):
+        name, w, h, codec, rates = self.current_mode()
+        fps = self.current_fps()
+        enc = self.encoder(w or 1920, h or 1080, codec, fps)
+        if enc is None:
+            self.say('No video encoder')
+            return
+        os.makedirs(VIDEOS, exist_ok=True)
+        path = os.path.join(VIDEOS, '%s-%s-%s%d.mp4' % (
+            self.cam.key, time.strftime('%Y%m%d-%H%M%S'), name, fps))
+        scale = min(1.0, 1280 / w, 720 / h) if w else 0.5
+        preview = ('width=%d,height=%d' % (int(w * scale) // 2 * 2,
+                                           int(h * scale) // 2 * 2)) if w else ''
+        orientation = TURNS[self.turns()][1]
+        tags = ' ! taginject tags="image-orientation=%s"' % orientation \
+            if orientation else ''
+        # The preview branch is a small copy at 15 fps; the sink takes
+        # BGRx from memory.
+        desc = (
+            '%s ! tee name=t '
+            't. ! queue max-size-buffers=1 leaky=downstream '
+            '! videorate drop-only=true max-rate=15 ! videoconvertscale '
+            '! video/x-raw,format=BGRx%s ! gtkwaylandsink name=sink '
+            't. ! queue max-size-buffers=3 ! %s%s ! queue '
+            '! mp4mux name=mux fragment-duration=1000 fragment-mode=first-moov-then-finalise '
+            '! filesink location="%s"' % (
+                self.cam.source(w, h, 'RGBA' if self.cam.dmabuf else None, fps),
+                ',' + preview if preview else '', enc, tags, path))
+        aenc = find_element('fdkaacenc', 'avenc_aac', 'voaacenc') if audio else None
+        if aenc:
+            mic = find_mic()
+            desc += (' pulsesrc name=asrc%s ! audioconvert name=aconv '
+                     '! audioresample name=aresample '
+                     '! audio/x-raw,rate=48000,channels=2 '
+                     '! %s name=aenc bitrate=160000 ! aacparse name=aparse '
+                     '! queue name=aqueue ! mux.'
+                     % (' device="%s"' % mic if mic else '', aenc))
+        self.stop_pipeline()
+        self.recording = (path, time.monotonic(), bool(aenc))
+        self.stopping = False
+        self.start(desc)
+        if self.cam.vblank and fps != 30:
+            # once frames flow: setting the sensor mode reset the blanking
+            pad = self.pipeline.get_by_name('src').get_static_pad('src')
+            pad.add_probe(Gst.PadProbeType.BUFFER, self.first_frame, fps)
+        self.clock_timer = GLib.timeout_add(500, self.tick)
+        self.update_labels()
+
+    def finish_recording(self):
+        """After EOS (or a timeout): close the file, back to photos."""
+        if self.recording is None:
+            return False
+        path = self.recording[0]
+        if self.clock_timer:
+            GLib.source_remove(self.clock_timer)
+            self.clock_timer = 0
+        self.recording = None
+        self.stopping = False
+        self.start_viewfinder()
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        log('video: %s %d bytes' % (path, size))
+        self.say('Saved %s' % path.replace(os.path.expanduser('~'), '~')
+                 if size else 'Recording failed')
+        return False
+
+    # -- events --------------------------------------------------------
+
+    def on_error(self, bus, msg):
+        err, debug = msg.parse_error()
+        src = msg.src.get_name() if msg.src else '?'
+        log('error from %s: %s (%s)' % (src, err.message, debug))
+        if self.recording is not None and self.recording[2] and \
+                src in AUDIO_ELEMENTS and not self.stopping:
+            # no microphone: record without sound
+            path = self.recording[0]
+            self.recording = None
+            if self.clock_timer:
+                GLib.source_remove(self.clock_timer)
+                self.clock_timer = 0
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            self.start_recording(audio=False)
+            self.say('No microphone: video without sound')
+            return
+        if self.recording is not None:
+            self.finish_recording()
+        self.say('Camera error: %s' % err.message, 30)
+
+    def on_eos(self, bus, msg):
+        if self.recording is not None:
+            self.finish_recording()
+
+    def on_key(self, widget, event):
+        key = Gdk.keyval_name(event.keyval)
+        actions = {
+            'space': self.take_photo, 'Return': self.take_photo,
+            'KP_Enter': self.take_photo, 'v': self.toggle_record,
+            'f': self.flip, 'q': self.next_quality, 's': self.next_fps,
+            'r': self.rotate,
+            'Escape': self.close,
+        }
+        action = actions.get(key)
+        if action is None:
+            return False
+        if self.cam is not None or action == self.close:
+            action()
+        return True
+
+    def on_delete(self, *args):
+        self.close()
+        return True
+
+    # -- actions -------------------------------------------------------
+
+    def current_mode(self):
+        modes = self.cam.modes
+        names = [m[0] for m in modes]
+        name = config_get('quality-' + self.cam.key, '1080p')
+        return modes[names.index(name) if name in names else 0]
+
+    def current_fps(self):
+        rates = self.current_mode()[4]
+        try:
+            fps = int(config_get('fps', '30'))
+        except ValueError:
+            fps = 30
+        return max([r for r in rates if r <= fps] or [rates[0]])
+
+    def next_quality(self, *args):
+        if self.recording is not None:
+            return
+        modes = self.cam.modes
+        i = modes.index(self.current_mode())
+        config_set('quality-' + self.cam.key, modes[(i + 1) % len(modes)][0])
+        self.update_labels()
+
+    def next_fps(self, *args):
+        if self.recording is not None:
+            return
+        rates = self.current_mode()[4]
+        i = rates.index(self.current_fps())
+        config_set('fps', rates[(i + 1) % len(rates)])
+        self.update_labels()
+
+    def first_frame(self, pad, info, fps):
+        # half a second in, not on the first frame: one front camera
+        # recording at 120 fps stalled when switched right away
+        GLib.timeout_add(500, set_sensor_fps, self.cam.id, fps)
+        return Gst.PadProbeReturn.REMOVE
+
+    def flip(self, *args):
+        if self.recording is not None or len(self.cameras) < 2:
+            return
+        i = self.cameras.index(self.cam)
+        self.cam = self.cameras[(i + 1) % len(self.cameras)]
+        config_set('camera', self.cam.key)
+        self.start_viewfinder()
+
+    def rotate(self, *args):
+        turns = (self.turns() + 1) % 4
+        config_set('rotation-' + self.cam.key, turns)
+        if self.sink is not None:
+            self.sink.set_property('rotate-method', TURNS[turns][0])
+
+    def toggle_record(self, *args):
+        if self.cam is None:
+            return
+        if self.recording is None:
+            self.start_recording()
+        elif not self.stopping:
+            self.stopping = True
+            self.say('Saving video...', 30)
+            self.pipeline.send_event(Gst.Event.new_eos())
+            # EOS normally arrives within a second; don't wait forever
+            GLib.timeout_add_seconds(8, lambda: self.stopping and
+                                     self.finish_recording())
+        self.update_labels()
+
+    def take_photo(self, *args):
+        if self.recording is not None:
+            self.say('Photos after recording')
+            return
+        sample = self.sink.get_property('last-sample') if self.sink else None
+        if sample is None or sample.get_buffer() is None:
+            log('photo: no frame yet')
+            self.say('No picture yet')
+            return
+        os.makedirs(PICTURES, exist_ok=True)
+        path = os.path.join(PICTURES, '%s-%s.jpg' % (
+            self.cam.key, time.strftime('%Y%m%d-%H%M%S')))
+        self.say('Saving photo...')
+        threading.Thread(target=self.save_photo,
+                         args=(sample, path, TURNS[self.turns()][1]),
+                         daemon=True).start()
+
+    def save_photo(self, sample, path, orientation):
+        ok = write_jpeg(sample, path, orientation)
+        log('photo: %s %s' % (path, 'saved' if ok else 'failed'))
+        GLib.idle_add(self.say, ('Saved %s' % path.replace(
+            os.path.expanduser('~'), '~')) if ok else 'Saving failed')
+
+    def close(self):
+        if self.recording is not None and not self.stopping:
+            # finish the file first, then close
+            self.toggle_record()
+            GLib.timeout_add(300, self.close_when_saved)
+            return
+        self.stop_pipeline()
+        Gtk.main_quit()
+
+    def close_when_saved(self):
+        if self.recording is not None:
+            return True
+        self.stop_pipeline()
+        Gtk.main_quit()
+        return False
+
+    # -- labels --------------------------------------------------------
+
+    def title(self):
+        if self.cam is None:
+            return 'No camera found'
+        return self.cam.name + ('\ncontinuous autofocus' if self.cam.af else '')
+
+    def say(self, text, seconds=4):
+        self.status.set_text(text)
+        if self.status_timer:
+            GLib.source_remove(self.status_timer)
+        self.status_timer = GLib.timeout_add_seconds(seconds, self.say_title)
+
+    def say_title(self):
+        self.status_timer = 0
+        self.status.set_text(self.title())
+        return False
+
+    def tick(self):
+        if self.recording is None:
+            return False
+        secs = int(time.monotonic() - self.recording[1])
+        self.buttons['record'].set_label('Stop  %d:%02d' % (secs // 60, secs % 60))
+        return True
+
+    def update_labels(self):
+        if not self.status_timer:
+            self.status.set_text(self.title())
+        if self.cam is None:
+            self.buttons['quality'].set_label('Video')
+            self.buttons['fps'].set_label('fps')
+            return
+        mode = self.current_mode()
+        self.buttons['quality'].set_label(
+            'Video: %s' % mode[0] + (' HEVC' if mode[3] == 'h265' else ''))
+        self.buttons['fps'].set_label('%d fps' % self.current_fps())
+        rec = self.buttons['record']
+        if self.recording is None:
+            rec.set_label('Record')
+            rec.get_style_context().remove_class('recording')
+        else:
+            self.tick()
+            rec.get_style_context().add_class('recording')
+        for key in ('photo', 'quality', 'fps'):
+            self.buttons[key].set_sensitive(self.recording is None)
+        self.buttons['flip'].set_sensitive(self.recording is None and
+                                           len(self.cameras) > 1)
+
+
+def h264_level(width, height, fps):
+    mbs = ((width + 15) // 16) * ((height + 15) // 16)
+    for level in H264_LEVELS:
+        if mbs <= level[3] and mbs * fps <= level[2]:
+            return level
+    return H264_LEVELS[-1]
+
+
+def sensor_subdev(camera_id):
+    """The sensor's V4L2 subdevice: libcamera names a camera on a device
+    tree system by its node's path."""
+    node = os.path.realpath('/sys/firmware/devicetree' + camera_id)
+    base = '/sys/class/video4linux'
+    for name in sorted(os.listdir(base)):
+        of_node = os.path.join(base, name, 'device', 'of_node')
+        if name.startswith('v4l-subdev') and os.path.realpath(of_node) == node:
+            return '/dev/' + name
+    return None
+
+
+def set_sensor_fps(camera_id, fps):
+    """Frame length = pixel rate / (line length * fps), as vertical blanking."""
+    dev = sensor_subdev(camera_id)
+    if dev is None:
+        log('fps: no sensor subdevice for %s' % camera_id)
+        return False
+    try:
+        out = subprocess.run(
+            ['v4l2-ctl', '-d', dev, '--get-subdev-fmt', 'pad=0', '-C',
+             'pixel_rate,horizontal_blanking'],
+            text=True, capture_output=True, timeout=5).stdout
+        values = {}
+        for line in out.splitlines():
+            key, _, value = line.partition(':')
+            values[key.strip()] = value.strip()
+        width, height = (int(v) for v in values['Width/Height'].split('/'))
+        line = width + int(values['horizontal_blanking'])
+        vblank = round(int(values['pixel_rate']) / (line * fps)) - height
+        res = subprocess.run(['v4l2-ctl', '-d', dev, '-c',
+                              'vertical_blanking=%d' % vblank],
+                             text=True, capture_output=True, timeout=5)
+        log('fps: %s %dx%d vblank %d for %d fps%s' % (
+            dev, width, height, vblank, fps,
+            (': ' + res.stderr.strip()) if res.returncode else ''))
+    except (OSError, subprocess.SubprocessError, KeyError, ValueError) as e:
+        log('fps: %s' % e)
+    return False
+
+
+def write_jpeg(sample, path, orientation):
+    tags = 'image-orientation=%s' % orientation if orientation else ''
+    pipe = Gst.parse_launch(
+        'appsrc name=in num-buffers=1 ! videoconvert ! jpegenc quality=93 '
+        '! taginject tags="%s" ! jifmux ! filesink location="%s"'
+        % (tags, path))
+    src = pipe.get_by_name('in')
+    src.set_property('caps', sample.get_caps())
+    src.set_property('format', Gst.Format.TIME)
+    pipe.set_state(Gst.State.PLAYING)
+    buf = sample.get_buffer().copy()
+    buf.pts = buf.dts = 0
+    src.emit('push-buffer', buf)
+    src.emit('end-of-stream')
+    msg = pipe.get_bus().timed_pop_filtered(
+        10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    pipe.set_state(Gst.State.NULL)
+    if msg is None or msg.type == Gst.MessageType.ERROR:
+        if msg is not None:
+            log('save: %s' % msg.parse_error()[0].message)
+        return False
+    return True
+
+
+def main():
+    if '--version' in sys.argv[1:]:
+        print('ocellus', VERSION)
+        return
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name('Ocellus')
+    Gst.init(None)
+    CameraApp()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

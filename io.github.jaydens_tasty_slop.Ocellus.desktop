@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Ocellus
+GenericName=Camera
+Comment=Take photos and videos
+Exec=ocellus
+Icon=camera-photo
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=camera;photo;video;picture;
+StartupNotify=true
+StartupWMClass=io.github.jaydens_tasty_slop.Ocellus
+X-Purism-FormFactor=Workstation;Mobile;
