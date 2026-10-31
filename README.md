@@ -45,7 +45,7 @@ You need a Wayland desktop. On postmarketOS or Alpine:
 
 ```
 apk add python3 py3-gobject3 gtk+3.0 gst-plugins-base gst-plugins-good \
-	gst-plugins-bad libcamera-gstreamer pulseaudio-utils v4l-utils
+	gst-plugins-bad libcamera-gstreamer pulseaudio-utils v4l-utils make
 make install
 ```
 
