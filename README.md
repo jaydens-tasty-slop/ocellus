@@ -38,7 +38,7 @@ pipeline with the GPU software ISP, and Venus encodes the video.
 
 | Camera | Photo | Video modes (fps) |
 |---|---|---|
-| Rear, Sony IMX258, autofocus | 3840x2160 | 4K H.265 (24), 1080p (30, 60), 720p (30, 60), 576p (30, 60, 120) |
+| Rear, Sony IMX258, autofocus | 4200x3120 | 4K H.265 (24), 1080p (30, 60), 720p (30, 60), 576p (30, 60, 120) |
 | Front, Samsung S5K5E3 | 2568x1932 | 1080p (30), 864p (30, 60), 384p (30, 60, 120) |
 
 Measured in the Plasma session with the viewfinder on and sound, from the
@@ -139,8 +139,9 @@ entry.
   being tested.
 - On the Tab S3, 4K is H.265 at 24 fps only. Venus encodes 4K at about
   29.8 fps, and it refuses 25.
-- A photo is a viewfinder frame, so the rear camera's photos are 3840x2160,
-  not the sensor's full 13 MP.
+- A photo is a viewfinder frame, so the viewfinder runs at the photo
+  size. For the rear camera that is 4200x3120 (the 13 MP sensor less the
+  ISP's 8-pixel border), and the viewfinder gets about 17 fps.
 - While recording, the viewfinder runs at 15 fps.
 
 ## License

@@ -45,19 +45,20 @@ TUNED = {
     # Samsung Galaxy Tab S3 (SM-T820): the simple pipeline with the GPU
     # software ISP, Venus encoder. libcamera picks the smallest sensor mode
     # that holds the size, and the frame rates are what that mode reaches:
-    # rear 4208x2368 (39 fps; the encoder manages about 29.8 at 4K and
+    # rear 4208x3120 (the photo size; the viewfinder gets about 17 fps
+    # there), 4208x2368 (39 fps; the encoder manages about 29.8 at 4K and
     # refuses 25, so 4K stays at 24), 2104x1184 (75), 1048x592 (144);
     # front 2576x1932 (30), 1280x960 (60), 640x480 (120). The ISP output
     # is 8 pixels narrower than the sensor mode, and Venus sizes the RGBA
     # buffers it imports for a width that is a multiple of 128 pixels, so
-    # all widths are (a narrower buffer is refused).
+    # all video widths are (a narrower buffer is refused).
     'samsung,gts3lwifi': {
         'vblank': True,
         'dmabuf': True,
         'cameras': {
             'imx258': {
                 'af': True,
-                'photo': (3840, 2160),
+                'photo': (4200, 3120),
                 'modes': [
                     ('4K', 3840, 2160, 'h265', (24,)),
                     ('1080p', 1920, 1080, 'h264', (30, 60)),
