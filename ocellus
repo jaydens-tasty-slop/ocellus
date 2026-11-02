@@ -80,6 +80,13 @@ TUNED = {
 }
 
 GENERIC_MODES = [('1080p', 1920, 1080), ('720p', 1280, 720), ('480p', 640, 480)]
+# The Galaxy Tab S3's LTE model (SM-T825, samsung,gts3llte) carries the
+# same cameras, ISP and encoder as the SM-T820, so it gets the same entry.
+# Confirmed on an SM-T825: both cameras match and report the tuned photo
+# sizes, rear contrast autofocus works, and hardware-encoded recording
+# works (front 864p through v4l2h264enc).
+TUNED['samsung,gts3llte'] = TUNED['samsung,gts3lwifi']
+
 # largest viewfinder and photo size on devices not in TUNED
 GENERIC_PHOTO_PIXELS = 3840 * 2160
 
