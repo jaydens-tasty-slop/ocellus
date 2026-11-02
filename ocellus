@@ -29,7 +29,8 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk
+gi.require_version('Pango', '1.0')
+from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk, Pango
 
 APP_ID = 'io.github.jaydens_tasty_slop.Ocellus'
 VERSION = '0.1'
@@ -110,6 +111,8 @@ TURNS = [
 ]
 
 AUDIO_ELEMENTS = ('asrc', 'aconv', 'aresample', 'aenc', 'aparse', 'aqueue')
+
+STATUS_LINES = 3
 
 CSS = b"""
 window, .panel { background: black; }
@@ -320,8 +323,16 @@ class CameraApp:
         self.status = Gtk.Label()
         self.status.get_style_context().add_class('cam')
         self.status.set_line_wrap(True)
+        self.status.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.status.set_lines(STATUS_LINES)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
         self.status.set_max_width_chars(16)
         self.status.set_justify(Gtk.Justification.CENTER)
+        # The panel is centered, so a message of another height or width
+        # would move every button. Keep the message's space the same.
+        height = self.status.create_pango_layout(
+            '\n'.join('X' * STATUS_LINES)).get_pixel_size()[1]
+        self.status.set_size_request(-1, height)
         panel.pack_start(self.status, False, False, 0)
 
         self.buttons = {}
