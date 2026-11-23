@@ -1,3 +1,5 @@
+> **COGNITOHAZARD WARNING:** This README is LLM generated! Avert your eyes!
+
 # Ocellus
 
 A camera app for Linux phones and tablets, built on libcamera and GStreamer.
